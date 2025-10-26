@@ -818,10 +818,14 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     MainWindow(){
-        sampleRate = 44100;
-        central = new QWidget;
-        setCentralWidget(central);
-        QVBoxLayout *l = new QVBoxLayout(central);
+    sampleRate = 44100;
+    central = new QWidget;
+    setCentralWidget(central);
+    // Left content (existing UI) will live inside `content`
+    QWidget *content = new QWidget;
+    QVBoxLayout *l = new QVBoxLayout(content);
+    // Main layout splits content (left) and the new WAV player (right)
+    QHBoxLayout *mainLayout = new QHBoxLayout(central);
 
         // Top controls
         QHBoxLayout *top = new QHBoxLayout;
@@ -958,13 +962,63 @@ public:
         specLabel->setMinimumHeight(256);
         specLabel->setMinimumWidth(512);
         specLabel->setStyleSheet("background: black;");
-        l->addWidget(specLabel);
+    l->addWidget(specLabel);
+
+    // --- Right panel: WAV player + realtime FFT -----------------
+    QWidget *rightPanel = new QWidget;
+    rightPanel->setMinimumWidth(320);
+    QVBoxLayout *rLay = new QVBoxLayout(rightPanel);
+    QLabel *wavTitle = new QLabel("WAV Player");
+    wavTitle->setAlignment(Qt::AlignCenter);
+    QFont ft = wavTitle->font(); ft.setBold(true);
+    wavTitle->setFont(ft);
+    rLay->addWidget(wavTitle);
+
+    btnLoadWav = new QPushButton("Load WAV");
+    btnPlayWav = new QPushButton("Play");
+    btnStopWav = new QPushButton("Stop");
+    lblWavFile = new QLabel("No WAV loaded");
+    lblWavFile->setWordWrap(true);
+
+    QHBoxLayout *wavBtns = new QHBoxLayout;
+    wavBtns->addWidget(btnLoadWav);
+    wavBtns->addWidget(btnPlayWav);
+    wavBtns->addWidget(btnStopWav);
+    rLay->addLayout(wavBtns);
+    rLay->addWidget(lblWavFile);
+
+    fftWidget = new FFTWidget;
+    fftWidget->setMinimumHeight(200);
+    fftWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    rLay->addWidget(fftWidget);
+
+    rLay->addStretch();
+
+    // Insert left content and right panel into main layout
+    mainLayout->addWidget(content, 3);
+    mainLayout->addWidget(rightPanel, 1);
 
         // Connections
         connect(btnLoadMidi, &QPushButton::clicked, this, &MainWindow::onLoadMidi);
         connect(btnRender, &QPushButton::clicked, this, &MainWindow::onRender);
         connect(btnSave, &QPushButton::clicked, this, &MainWindow::onSave);
         connect(btnPreview, &QPushButton::clicked, this, &MainWindow::onPreview);
+
+        // WAV player backend and UI connections
+        wavPlayer = new WAVPlayer(this);
+        connect(btnLoadWav, &QPushButton::clicked, this, [this]() {
+            QString file = QFileDialog::getOpenFileName(this, "Open WAV", ".", "WAV files (*.wav)");
+            if(file.isEmpty()) return;
+            if(!wavPlayer->loadFile(file)) {
+                QMessageBox::warning(this, "Error", "Failed to load WAV file");
+                return;
+            }
+            lblWavFile->setText(file);
+        });
+        connect(btnPlayWav, &QPushButton::clicked, wavPlayer, &WAVPlayer::play);
+        connect(btnStopWav, &QPushButton::clicked, wavPlayer, &WAVPlayer::stop);
+        // realtime FFT from WAVPlayer -> FFTWidget
+        connect(wavPlayer, &WAVPlayer::fftUpdated, fftWidget, &FFTWidget::updateFFT);
 
         setWindowTitle("TP2 - Synthesis All-in-One");
         resize(900,700);
