@@ -1,0 +1,4 @@
+/home/rami/ASSD/Sinte_ASSD/build/CMakeFiles/tp2_allinone.dir
+/home/rami/ASSD/Sinte_ASSD/build/CMakeFiles/edit_cache.dir
+/home/rami/ASSD/Sinte_ASSD/build/CMakeFiles/rebuild_cache.dir
+/home/rami/ASSD/Sinte_ASSD/build/CMakeFiles/tp2_allinone_autogen.dir
