@@ -4,8 +4,38 @@
 // Karplus-Strong, sample playback (WAV), delay/reverb simples, espectrograma, export WAV.
 // Compilar con Qt (widgets, multimedia). C++17.
 
-#include <QtWidgets>
-#include <QtMultimedia>
+#include <QtWidgets/QApplication>
+#include <QtMultimedia/QAudio>
+#include <QtMultimedia/QAudioDeviceInfo>
+#include <QtMultimedia/QAudioFormat>
+#include <QtMultimedia/QAudioOutput>
+#include <QtCore/QBuffer>
+#include <QtCore/QByteArray>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QComboBox>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QDir>
+#include <QtWidgets/QDoubleSpinBox>
+#include <QtCore/QFile>
+#include <QtWidgets/QFileDialog>
+#include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QHBoxLayout>
+#include <QtGui/QImage>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QListWidget>
+#include <QtWidgets/QMainWindow>
+#include <QtWidgets/QMessageBox>
+#include <QtGui/QPainter>
+#include <QtGui/QPixmap>
+#include <QtWidgets/QProgressBar>
+#include <QtWidgets/QPushButton>
+#include <QtCore/QRegExp>
+#include <QtWidgets/QSlider>
+#include <QtCore/QString>
+#include <QtCore/QTimer>
+#include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QWidget>
 #include <complex>
 #include <vector>
 #include <cmath>
@@ -15,6 +45,7 @@
 #include <cstdint>
 #include <memory>
 #include <functional>
+#include <map>
 
 using namespace std;
 using cfloat = complex<float>;
@@ -514,9 +545,106 @@ struct TrackSynthConfig {
     // Karplus params
     float ksDecay = 0.996f;
     // sample
-    vector<float> sample;
+    // For sample-based instruments: map rootMidiNote -> sample data
+    std::map<int, vector<float>> sampleMap;
+    std::map<int, uint32_t> sampleRates;
+    QString sampleInstrumentName;
     uint32_t sampleRate=44100;
 };
+
+// --------------------------- Sample utilities ------------------------------
+
+// Convert note name like C4, C#3, Db3 to MIDI number (C4 = 60)
+static bool noteNameToMidi(const QString &name, int &outMidi) {
+    if(name.isEmpty()) return false;
+    QString s = name.trimmed();
+    // accept forms like C4 or C#4 or Db4
+    QRegExp re("^([A-Ga-g])([#b]?)(-?\\d+)$");
+    if(!re.exactMatch(s)) return false;
+    QString pitch = re.cap(1).toUpper();
+    QString accidental = re.cap(2);
+    int octave = re.cap(3).toInt();
+    int base = 0;
+    if(pitch=="C") base = 0;
+    else if(pitch=="D") base = 2;
+    else if(pitch=="E") base = 4;
+    else if(pitch=="F") base = 5;
+    else if(pitch=="G") base = 7;
+    else if(pitch=="A") base = 9;
+    else if(pitch=="B") base = 11;
+    if(accidental=="#") base += 1;
+    else if(accidental=="b") base -= 1;
+    int midi = (octave + 1) * 12 + base; // C-1 = 0, C4 = 60
+    outMidi = midi;
+    return (midi >= 0 && midi <= 127);
+}
+
+// Resample by linear interpolation to produce `outLen` samples at outRate,
+// pitch-shifting according to rootMidi -> targetMidi.
+static vector<float> resamplePitchToLength(const vector<float>& src, uint32_t srcRate, uint32_t outRate, int rootMidi, int targetMidi, size_t outLen){
+    vector<float> out;
+    if(src.empty() || outLen==0) return out;
+    double fRoot = midiNoteFreq(rootMidi);
+    double fTarget = midiNoteFreq(targetMidi);
+    double pitchRatio = fTarget / fRoot; // >1 for higher pitch
+    // increment in source samples per output sample
+    double inc = (double)srcRate / (double)outRate * pitchRatio;
+    out.reserve(outLen);
+    double pos = 0.0;
+    for(size_t n=0;n<outLen;n++){
+        // linear interp
+        long i0 = (long)floor(pos);
+        long i1 = i0 + 1;
+        float s0 = (i0>=0 && i0 < (long)src.size()) ? src[i0] : 0.0f;
+        float s1 = (i1>=0 && i1 < (long)src.size()) ? src[i1] : 0.0f;
+        float frac = float(pos - floor(pos));
+        float v = s0 * (1.0f - frac) + s1 * frac;
+        out.push_back(v);
+        pos += inc;
+        if(pos >= (double)src.size()) {
+            // reached end of source: clamp to end (will produce zeros thereafter)
+            pos = (double)src.size();
+        }
+    }
+    return out;
+}
+
+// Load all sample instruments from a Resources folder. Each subfolder -> an instrument.
+static std::map<QString, TrackSynthConfig> loadSampleInstrumentsFromResources(){
+    std::map<QString, TrackSynthConfig> out;
+    QStringList candidatePaths;
+    candidatePaths << QDir::currentPath() + "/Resources";
+    candidatePaths << QCoreApplication::applicationDirPath() + "/Resources";
+    candidatePaths << QCoreApplication::applicationDirPath() + "/../Resources";
+
+    QString foundPath;
+    for(const QString &p : candidatePaths){ if(QDir(p).exists()){ foundPath = p; break; } }
+    if(foundPath.isEmpty()) return out;
+
+    QDir base(foundPath);
+    QStringList folders = base.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for(const QString &f : folders){
+        QDir instDir(base.filePath(f));
+        TrackSynthConfig cfg;
+        cfg.type = TrackSynthConfig::SAMPLE;
+        cfg.sampleInstrumentName = f;
+        // find wav files
+        QStringList wavs = instDir.entryList(QStringList() << "*.wav" << "*.WAV", QDir::Files);
+        for(const QString &wf : wavs){
+            QString stem = QFileInfo(wf).baseName(); // e.g., C4
+            int midi=0;
+            if(!noteNameToMidi(stem, midi)) continue;
+            vector<float> s;
+            uint32_t sr=44100;
+            if(readWAV(instDir.filePath(wf), s, sr)){
+                cfg.sampleMap[midi] = s;
+                cfg.sampleRates[midi] = sr;
+            }
+        }
+        if(!cfg.sampleMap.empty()) out[QString(f)] = cfg;
+    }
+    return out;
+}
 
 // Callback function type for progress reporting
 using ProgressCallback = std::function<void(float)>;
@@ -574,9 +702,26 @@ vector<float> renderMidi(const MidiFile& mf, const vector<TrackSynthConfig>& con
                 } else if(cfg.type == TrackSynthConfig::KARPLUS){
                     noteBuf = karplusStrong(ev.note, dur, sampleRate, cfg.ksDecay);
                 } else { // SAMPLE
-                    // naive: copy sample, or stretch if needed (no resampling implemented)
-                    if(cfg.sample.empty()) continue;
-                    noteBuf = cfg.sample;
+                    if(cfg.sampleMap.empty()) continue;
+                    // find nearest root sample
+                    int bestRoot = -1;
+                    int bestDist = 1000;
+                    for(const auto &kv : cfg.sampleMap){
+                        int root = kv.first;
+                        int d = abs(root - (int)ev.note);
+                        if(d < bestDist){ bestDist = d; bestRoot = root; }
+                    }
+                    if(bestRoot < 0) continue;
+                    const vector<float> &src = cfg.sampleMap.at(bestRoot);
+                    uint32_t srcRate = cfg.sampleRates.count(bestRoot) ? cfg.sampleRates.at(bestRoot) : cfg.sampleRate;
+                    size_t outLen = (size_t)round(dur * sampleRate);
+                    noteBuf = resamplePitchToLength(src, srcRate, sampleRate, bestRoot, ev.note, outLen);
+                    // apply basic ADSR envelope if present in cfg.env
+                    for(size_t n=0; n<noteBuf.size(); ++n){
+                        float t = float(n) / float(sampleRate);
+                        float envv = cfg.env.env(t, dur);
+                        noteBuf[n] *= envv;
+                    }
                 }
 
                 // Update progress after each note
@@ -608,35 +753,121 @@ vector<float> renderMidi(const MidiFile& mf, const vector<TrackSynthConfig>& con
 QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=1024, int hop=512){
     int Nwin = winSize;
     int Nhop = hop;
-    size_t frames = (audio.size() < Nwin) ? 1 : 1 + (audio.size()-Nwin)/Nhop;
+    size_t frames = (audio.size() < (size_t)Nwin) ? 1 : 1 + (audio.size()-Nwin)/Nhop;
+    // target image height (frequency bins). Use Nwin/2 but allow fewer to improve vertical resolution if desired
     int height = Nwin/2;
-    QImage img(frames, height, QImage::Format_RGB32);
+    QImage img((int)frames, height, QImage::Format_RGB32);
     img.fill(Qt::black);
-    vector<complex<float>> in(Nwin), out(Nwin);
+
+    // Precompute Hann window
     vector<float> window(Nwin);
-    // Hann
     for(int i=0;i<Nwin;i++) window[i] = 0.5f*(1 - cos(2*M_PI*i/(Nwin-1)));
-    for(size_t f=0; f<frames; ++f){
-        size_t start = f * Nhop;
+
+    // For each frame compute FFT magnitudes (only first Nwin/2 bins)
+    const float eps = 1e-12f;
+    const float fmin = 20.0f;
+    const float fmax = std::min(20000.0f, sr/2.0f);
+    const float dynamicRange = 80.0f; // display range in dB
+
+    vector<complex<float>> tin(Nwin), tout(Nwin);
+    vector<float> magDB(Nwin/2);
+
+    for(size_t frameIdx=0; frameIdx<frames; ++frameIdx){
+        size_t start = frameIdx * Nhop;
+        // fill input buffer with windowed samples
         for(int n=0;n<Nwin;n++){
             float s = (start + n < audio.size()) ? audio[start+n] : 0.0f;
-            in[n] = complex<float>(s * window[n], 0.0f);
+            tin[n] = complex<float>(s * window[n], 0.0f);
         }
-        // perform fft via our API
-        vector<complex<float>> tin(Nwin), tout(Nwin);
-        for(int i=0;i<Nwin;i++) tin[i]=in[i];
+        // FFT
         fft(&tin[0], &tout[0], Nwin);
-        for(int k=0;k<height;k++){
-            float mag = abs(tout[k]) / Nwin;
-            float db = 20*log10f(max(1e-6f, mag));
-            // map db range -100..0 to 0..255
-            float v = (db + 100.0f) / 100.0f;
-            int iv = max(0, min(255, (int)round(v*255)));
-            QColor c = QColor::fromHsv((int)(iv*0.7), 255, iv);
-            img.setPixel(f, height-1-k, c.rgb());
+
+        // magnitude -> dB
+        float maxDb = -1e9f;
+        for(int k=0;k<Nwin/2;k++){
+            float mag = abs(tout[k]) / (float)Nwin; // normalization
+            float db = 20.0f * log10(max(eps, mag));
+            magDB[k] = db;
+            if(db > maxDb) maxDb = db;
+        }
+
+        // set display range relative to maxDb
+        float topDb = maxDb; // 0 dB reference is local max
+        float bottomDb = topDb - dynamicRange;
+
+        // For each vertical pixel (row) compute corresponding frequency (log scale) and interpolate bin dB
+        for(int row=0; row<height; ++row){
+            // row 0 -> low freq (bottom), row height-1 -> high freq (top)
+            float t = float(row) / float(max(1, height-1));
+            // logarithmic mapping from fmin..fmax
+            float fy = fmin * powf(fmax/fmin, t);
+            // corresponding bin (fractional)
+            float binPos = fy * (float)Nwin / (float)sr;
+            if(binPos < 0) binPos = 0;
+            if(binPos > (Nwin/2 - 1)) binPos = (float)(Nwin/2 - 1);
+            int b0 = (int)floor(binPos);
+            int b1 = min((int)(Nwin/2 - 1), b0 + 1);
+            float frac = binPos - b0;
+            float dbv = (1.0f - frac) * magDB[b0] + frac * magDB[b1];
+
+            // map db to 0..1 between bottomDb..topDb
+            float v = (dbv - bottomDb) / (topDb - bottomDb);
+            v = std::max(0.0f, std::min(1.0f, v));
+            int iv = (int)round(v * 255.0f);
+
+            // colormap: blue (low) -> cyan -> yellow -> red (high)
+            // map iv 0..255 to HSV-like color via manual interpolation
+            QColor c;
+            if(iv <= 85){ // blue -> cyan
+                float t2 = iv / 85.0f;
+                int r = (int)round(0 + t2 * 0);
+                int g = (int)round(0 + t2 * 255);
+                int b = (int)round(128 + t2 * 127);
+                c = QColor(r,g,b);
+            } else if(iv <= 170){ // cyan -> yellow
+                float t2 = (iv - 85) / 85.0f;
+                int r = (int)round(0 + t2 * 255);
+                int g = 255;
+                int b = (int)round(255 - t2 * 255);
+                c = QColor(r,g,b);
+            } else { // yellow -> red
+                float t2 = (iv - 170) / 85.0f;
+                int r = 255;
+                int g = (int)round(255 - t2 * 255);
+                int b = 0;
+                c = QColor(r,g,b);
+            }
+
+            // image y coordinate: top is high freq, so invert row
+            int y = (height - 1) - row;
+            img.setPixel((int)frameIdx, y, c.rgb());
         }
     }
-    return img.mirrored();
+
+    return img;
+}
+
+// Overlay harmonic horizontal lines (log-frequency mapping) onto an existing spectrogram image.
+static void overlayHarmonics(QImage &img, uint32_t sr, int winSize, float fundHz, int numHarmonics = 8, float fmin = 20.0f){
+    if(img.isNull() || fundHz <= 0.0f) return;
+    int width = img.width();
+    int height = img.height();
+    float fmax = std::min(20000.0f, sr / 2.0f);
+    if(fmin >= fmax) return;
+    QPainter p(&img);
+    QPen pen(QColor(255,255,255,220));
+    pen.setWidth(1.3f);
+    p.setPen(pen);
+    // draw thinner dashed lines for harmonics
+    for(int h=1; h<=numHarmonics; ++h){
+        float fy = fundHz * float(h);
+        if(fy < fmin || fy > fmax) continue;
+        float t = logf(fy / fmin) / logf(fmax / fmin);
+        float row = t * float(max(1, height-1));
+        int y = int(round((height - 1) - row));
+        p.drawLine(0, y, width-1, y);
+    }
+    p.end();
 }
 
 // --------------------------- Qt GUI -------------------------------------------
@@ -647,12 +878,15 @@ public:
     FFTWidget(QWidget* parent = nullptr) : QWidget(parent) {
         setMinimumSize(200, 100);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        sampleRate = 44100;
     }
 
     void updateFFT(const vector<float>& magnitudes) {
         fftData = magnitudes;
         update();
     }
+
+    void setSampleRate(int sr){ sampleRate = sr; }
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -677,6 +911,7 @@ protected:
 
 private:
     vector<float> fftData;
+    int sampleRate;
 };
 
 class WAVPlayer : public QObject {
@@ -756,6 +991,8 @@ public:
         fftTimer->stop();
     }
 
+    int getSampleRate() const { return sampleRate; }
+
 signals:
     void fftUpdated(const vector<float>& magnitudes);
 
@@ -806,7 +1043,6 @@ private slots:
         if(pos >= buffer->size())
             buffer->seek(0);
     }
-
 private:
     QAudioOutput* audio;
     QBuffer* buffer;
@@ -817,15 +1053,60 @@ private:
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
+    // Declaración de variables miembro
+    QWidget *central;
+    QPushButton *btnLoadMidi, *btnRender, *btnSave, *btnPreview;
+    QLabel *lblMidi;
+    QListWidget *lstTracks;
+    QComboBox *cmbSynth;
+    QComboBox *cmbInstrument;
+    QComboBox *cmbSampleInstrument;
+    QDoubleSpinBox *spinSecondsPerBeat;
+    QLabel *specLabel;
+    QProgressBar *progressBar;
+    
+    // Effects controls
+    QCheckBox *chkDelay;
+    QSlider *sldDelayTime;
+    QSlider *sldDelayFeedback;
+    QSlider *sldDelayMix;
+    QCheckBox *chkReverb;
+    QSlider *sldReverbRoom;
+    QSlider *sldReverbDamping;
+    QSlider *sldReverbWet;
+    QCheckBox *chkFlanger;
+    QSlider *sldFlangerRate;
+    QSlider *sldFlangerDepth;
+    QSlider *sldFlangerFeedback;
+    QSlider *sldFlangerMix;
+    
+    // WAV Player and FFT display
+    WAVPlayer *wavPlayer;
+    QPushButton *btnLoadWav;
+    QPushButton *btnPlayWav;
+    QPushButton *btnStopWav;
+    QLabel *lblWavFile;
+    FFTWidget *fftWidget;
+    
+    // Data
+    MidiFile midi;
+    vector<TrackSynthConfig> trackConfigs;
+    vector<float> rendered;
+    uint32_t sampleRate;
+    std::map<QString, TrackSynthConfig> sampleInstruments;
     MainWindow(){
     sampleRate = 44100;
     central = new QWidget;
     setCentralWidget(central);
+    // We'll use a central vertical layout so we can place the main (left/right)
+    // area above and have the progress bar + spectrogram span the full width below.
+    QVBoxLayout *centralLayout = new QVBoxLayout(central);
     // Left content (existing UI) will live inside `content`
     QWidget *content = new QWidget;
     QVBoxLayout *l = new QVBoxLayout(content);
     // Main layout splits content (left) and the new WAV player (right)
-    QHBoxLayout *mainLayout = new QHBoxLayout(central);
+    QHBoxLayout *mainLayout = new QHBoxLayout;
+    centralLayout->addLayout(mainLayout);
 
         // Top controls
         QHBoxLayout *top = new QHBoxLayout;
@@ -920,8 +1201,8 @@ public:
         // Right panel: synth params
         QWidget *paramWidget = new QWidget;
         QFormLayout *pf = new QFormLayout(paramWidget);
-        cmbSynth = new QComboBox;
-        cmbSynth->addItems({"Additive","FM","Karplus-Strong"});
+    cmbSynth = new QComboBox;
+    cmbSynth->addItems({"Additive","FM","Karplus-Strong","Sample"});
         pf->addRow("Synth type:", cmbSynth);
 
         // Instrument presets for additive synthesis
@@ -930,8 +1211,19 @@ public:
             cmbInstrument->addItem(preset.name);
         }
         pf->addRow("Instrument:", cmbInstrument);
+
+        // Sample instrument selector (populated from Resources/)
+        cmbSampleInstrument = new QComboBox;
+        sampleInstruments = loadSampleInstrumentsFromResources();
+        if(!sampleInstruments.empty()){
+            for(const auto &kv : sampleInstruments) cmbSampleInstrument->addItem(kv.first);
+        } else {
+            cmbSampleInstrument->addItem("(No sample instruments found)");
+            cmbSampleInstrument->setEnabled(false);
+        }
+        pf->addRow("Sample instrument:", cmbSampleInstrument);
         
-        spinSecondsPerBeat = new QDoubleSpinBox; spinSecondsPerBeat->setRange(0.1,2.0); spinSecondsPerBeat->setValue(0.5);
+        spinSecondsPerBeat = new QDoubleSpinBox; spinSecondsPerBeat->setRange(0.1,2.0); spinSecondsPerBeat->setValue(1.0);
         pf->addRow("sec/beat:", spinSecondsPerBeat);
         btnPreview = new QPushButton("Preview note (A4)");
         pf->addRow(btnPreview);
@@ -939,30 +1231,34 @@ public:
         // Show/hide instrument selector based on synth type
         auto updateInstrumentVisibility = [this]() {
             bool isAdditive = cmbSynth->currentText() == "Additive";
+            bool isSample = cmbSynth->currentText() == "Sample";
             cmbInstrument->setVisible(isAdditive);
             QWidget* label = qobject_cast<QFormLayout*>(cmbInstrument->parentWidget()->layout())->labelForField(cmbInstrument);
             if (label) label->setVisible(isAdditive);
+            this->cmbSampleInstrument->setVisible(isSample);
+            QWidget* sLabel = qobject_cast<QFormLayout*>(this->cmbSampleInstrument->parentWidget()->layout())->labelForField(this->cmbSampleInstrument);
+            if(sLabel) sLabel->setVisible(isSample);
         };
         connect(cmbSynth, &QComboBox::currentTextChanged, updateInstrumentVisibility);
         updateInstrumentVisibility();
         midPanel->addWidget(paramWidget);
         l->addLayout(midPanel);
 
-        // Progress bar
+        // Progress bar (we'll add it to centralLayout so it spans full width)
         progressBar = new QProgressBar;
         progressBar->setRange(0, 10000); // Para precisión de 0.01%
         progressBar->setTextVisible(true);
         progressBar->setFormat("Renderizando: %p%");
         progressBar->hide();
-        l->addWidget(progressBar);
 
-        // Spectrogram display
+        // Spectrogram display (also placed in centralLayout to span full width)
         specLabel = new QLabel;
         specLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         specLabel->setMinimumHeight(256);
-        specLabel->setMinimumWidth(512);
+        specLabel->setMinimumWidth(0);
         specLabel->setStyleSheet("background: black;");
-    l->addWidget(specLabel);
+        specLabel->setScaledContents(true);  // Hacer que la imagen se estire para llenar todo el espacio
+        specLabel->setAlignment(Qt::AlignCenter);  // Centrar el contenido
 
     // --- Right panel: WAV player + realtime FFT -----------------
     QWidget *rightPanel = new QWidget;
@@ -998,6 +1294,11 @@ public:
     mainLayout->addWidget(content, 3);
     mainLayout->addWidget(rightPanel, 1);
 
+    // Now place the progress bar and spectrogram under the main area so they span
+    // the whole window (under both left and right panes).
+    centralLayout->addWidget(progressBar);
+    centralLayout->addWidget(specLabel);
+
         // Connections
         connect(btnLoadMidi, &QPushButton::clicked, this, &MainWindow::onLoadMidi);
         connect(btnRender, &QPushButton::clicked, this, &MainWindow::onRender);
@@ -1014,6 +1315,8 @@ public:
                 return;
             }
             lblWavFile->setText(file);
+            // forward sample rate to FFT widget for axis drawing
+            fftWidget->setSampleRate(wavPlayer->getSampleRate());
         });
         connect(btnPlayWav, &QPushButton::clicked, wavPlayer, &WAVPlayer::play);
         connect(btnStopWav, &QPushButton::clicked, wavPlayer, &WAVPlayer::stop);
@@ -1060,10 +1363,11 @@ private slots:
         progressBar->show();
         QApplication::processEvents();
 
-        // Set synth types according to ui (simple: same for all tracks)
-        TrackSynthConfig::Type type = TrackSynthConfig::ADDITIVE;
-        if(cmbSynth->currentText()=="FM") type = TrackSynthConfig::FM;
-        else if(cmbSynth->currentText()=="Karplus-Strong") type = TrackSynthConfig::KARPLUS;
+    // Set synth types according to ui (simple: same for all tracks)
+    TrackSynthConfig::Type type = TrackSynthConfig::ADDITIVE;
+    if(cmbSynth->currentText()=="FM") type = TrackSynthConfig::FM;
+    else if(cmbSynth->currentText()=="Karplus-Strong") type = TrackSynthConfig::KARPLUS;
+    else if(cmbSynth->currentText()=="Sample") type = TrackSynthConfig::SAMPLE;
         
         // Update track configs
         for(auto &cfg: trackConfigs) {
@@ -1077,6 +1381,15 @@ private slots:
                 // Ensure sample rate is set for all envelopes
                 for(auto &env : cfg.partialEnvs) {
                     env.sampleRate = sampleRate;
+                }
+            } else if(type == TrackSynthConfig::SAMPLE) {
+                // copy selected sample instrument data into track config
+                QString sel = cmbSampleInstrument->currentText();
+                if(sampleInstruments.count(sel)){
+                    const auto &srcCfg = sampleInstruments.at(sel);
+                    cfg.sampleMap = srcCfg.sampleMap;
+                    cfg.sampleRates = srcCfg.sampleRates;
+                    cfg.sampleInstrumentName = srcCfg.sampleInstrumentName;
                 }
             }
         }
@@ -1123,7 +1436,53 @@ private slots:
         
         // spectrogram
         QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512);
-        specLabel->setPixmap(QPixmap::fromImage(spec).scaled(specLabel->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+        // draw axes (time/frequency) and set pixmap
+        auto pix = [&]()->QPixmap{
+            // create pixmap with axes
+            int imgW = spec.width();
+            int imgH = spec.height();
+            // margin for labels
+            int leftMargin = 60;
+            int bottomMargin = 24;
+            QPixmap pm(leftMargin + imgW, imgH + bottomMargin);
+            pm.fill(Qt::black);
+            QPainter p(&pm);
+            // draw background for axes area
+            p.fillRect(0, 0, leftMargin, imgH, Qt::black);
+            p.fillRect(leftMargin, imgH, imgW, bottomMargin, Qt::black);
+            
+            // draw spectrogram image
+            p.drawImage(leftMargin, 0, spec);
+            p.setPen(Qt::white);
+            QFont f = p.font(); f.setPointSize(10); p.setFont(f);
+            
+            // time axis (bottom)
+            float duration = (rendered.empty()) ? 0.0f : (float(rendered.size())/sampleRate);
+            int ticks = 5;
+            for(int i=0;i<=ticks;i++){
+                float tx = leftMargin + (imgW * (float(i)/ticks));
+                float tval = duration * (float(i)/ticks);
+                QString lbl = (tval>=1.0f) ? QString("%1s").arg(tval,0,'f',2) : QString("%1ms").arg(tval*1000.0f,0,'f',0);
+                p.drawLine(QPointF(tx, imgH), QPointF(tx, imgH+5));
+                p.drawText(QPointF(tx-20, imgH+18), lbl);
+            }
+            // frequency axis (left) - log ticks
+            float fmin = 20.0f; float fmax = min(20000.0f, sampleRate/2.0f);
+            QVector<double> freqs = {20,50,100,200,500,1000,2000,5000,10000,20000};
+            for(double fq : freqs){
+                if(fq < fmin || fq > fmax) continue;
+                // compute row as in renderSpectrogram
+                float t = logf(fq / fmin) / logf(fmax / fmin);
+                float row = t * float(max(1, imgH-1));
+                int y = int(round((imgH - 1) - row));
+                p.drawLine(QPointF(leftMargin-4, y), QPointF(leftMargin, y));
+                QString lbl = (fq>=1000.0) ? QString("%1k").arg(fq/1000.0,0,'f', (fq>=1000 && fq<10000)?1:0) : QString::number((int)fq);
+                p.drawText(QPointF(2, y+4), lbl);
+            }
+            p.end();
+            return pm;
+        }();
+        specLabel->setPixmap(pix.scaled(specLabel->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
         // Update progress to 100% and hide
         progressBar->setValue(10000);
         QApplication::processEvents();
@@ -1145,33 +1504,7 @@ private slots:
         }
     }
 
-    void onPreview(){
-        // simple preview: synth A4 for 2s with chosen synth type
-        int midiNote = 69;
-        float dur = 2.0f;
-        vector<float> buf;
-        TrackSynthConfig cfg;
-        cfg.partialEnvs.resize(cfg.partialAmps.size());
-        if(cmbSynth->currentText()=="Additive"){
-            cfg.type = TrackSynthConfig::ADDITIVE;
-            auto presets = InstrumentPreset::getAllPresets();
-            const auto& preset = presets[cmbInstrument->currentIndex()];
-            buf = synthAdditive(midiNote, dur, sampleRate, preset.partialAmps, preset.envelopes);
-        } else if(cmbSynth->currentText()=="FM"){
-            cfg.type = TrackSynthConfig::FM;
-            buf = synthFM(midiNote, dur, sampleRate, cfg.carrierRatio, cfg.modRatio, cfg.modIndex, cfg.env);
-        } else {
-            buf = karplusStrong(midiNote, dur, sampleRate, cfg.ksDecay);
-        }
-        // store rendered and show spectrogram
-        rendered = buf;
-        QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512);
-        specLabel->setPixmap(QPixmap::fromImage(spec).scaled(specLabel->size(), Qt::KeepAspectRatio));
-        // play using QAudioOutput (simple)
-        playBuffer(rendered);
-    }
-
-    void playBuffer(const vector<float>& buf){
+    void playBuffer(const vector<float>& buf) {
         QAudioFormat format;
         format.setSampleRate(sampleRate);
         format.setChannelCount(1);
@@ -1204,51 +1537,98 @@ private slots:
         });
     }
 
-private:
-    QWidget *central;
-    QPushButton *btnLoadMidi, *btnRender, *btnSave, *btnPreview;
-    QLabel *lblMidi;
-    QListWidget *lstTracks;
-    QComboBox *cmbSynth;
-    QComboBox *cmbInstrument;
-    QDoubleSpinBox *spinSecondsPerBeat;
-    QLabel *specLabel;
-    QProgressBar *progressBar;
+    void onPreview() {
+        // simple preview: synth A4 for 2s with chosen synth type
+        int midiNote = 69;
+        float dur = 2.0f;
+        vector<float> buf;
+        TrackSynthConfig cfg;
+        cfg.partialEnvs.resize(cfg.partialAmps.size());
+        if(cmbSynth->currentText()=="Additive"){
+            cfg.type = TrackSynthConfig::ADDITIVE;
+            auto presets = InstrumentPreset::getAllPresets();
+            const auto& preset = presets[cmbInstrument->currentIndex()];
+            buf = synthAdditive(midiNote, dur, sampleRate, preset.partialAmps, preset.envelopes);
+        } else if(cmbSynth->currentText()=="FM"){
+            cfg.type = TrackSynthConfig::FM;
+            buf = synthFM(midiNote, dur, sampleRate, cfg.carrierRatio, cfg.modRatio, cfg.modIndex, cfg.env);
+        } else if(cmbSynth->currentText()=="Sample"){
+            // preview using selected sample instrument
+            QString sel = cmbSampleInstrument->currentText();
+            if(sampleInstruments.count(sel)){
+                const auto &srcCfg = sampleInstruments.at(sel);
+                // pick nearest root to A4 (69)
+                int bestRoot=-1; int bestDist=1000;
+                for(const auto &kv: srcCfg.sampleMap){ int d = abs(kv.first - midiNote); if(d<bestDist){bestDist=d; bestRoot=kv.first;} }
+                if(bestRoot>=0){
+                    uint32_t srcRate = srcCfg.sampleRates.count(bestRoot)?srcCfg.sampleRates.at(bestRoot):srcCfg.sampleRate;
+                    buf = resamplePitchToLength(srcCfg.sampleMap.at(bestRoot), srcRate, sampleRate, bestRoot, midiNote, (size_t)round(dur*sampleRate));
+                    // apply ADSR
+                    for(size_t n=0;n<buf.size();++n){ float t = float(n)/sampleRate; buf[n] *= cfg.env.env(t,dur); }
+                }
+            }
+        } else {
+            buf = karplusStrong(midiNote, dur, sampleRate, cfg.ksDecay);
+        }
+        // store rendered and show spectrogram
+        rendered = buf;
+        QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512);
 
-    // Effects controls
-    QCheckBox *chkDelay;
-    QSlider *sldDelayTime;
-    QSlider *sldDelayFeedback;
-    QSlider *sldDelayMix;
-    QCheckBox *chkReverb;
-    QSlider *sldReverbRoom;
-    QSlider *sldReverbDamping;
-    QSlider *sldReverbWet;
-    
-    // Flanger controls
-    QCheckBox *chkFlanger;
-    QSlider *sldFlangerRate;
-    QSlider *sldFlangerDepth;
-    QSlider *sldFlangerFeedback;
-    QSlider *sldFlangerMix;
+        // overlay harmonics for A4 preview to help visual verification
+        overlayHarmonics(spec, sampleRate, 1024, 440.0f, 12, 20.0f);
+        // draw axes and set pixmap
+        QPixmap pph;
+        {
+            int imgW = spec.width();
+            int imgH = spec.height();
+            int leftMargin = 60;
+            int bottomMargin = 24;
+            QPixmap pm(leftMargin + imgW, imgH + bottomMargin);
+            pm.fill(Qt::black);
+            QPainter p(&pm);
+            p.drawImage(leftMargin, 0, spec);
+            p.setPen(Qt::white);
+            QFont f = p.font(); f.setPointSize(10); p.setFont(f);
+            // time axis
+            float duration = (rendered.empty()) ? 0.0f : (float(rendered.size())/sampleRate);
+            int ticks = 5;
+            for(int i=0;i<=ticks;i++){
+                float tx = leftMargin + (imgW * (float(i)/ticks));
+                float tval = duration * (float(i)/ticks);
+                QString lbl = (tval>=1.0f) ? QString("%1s").arg(tval,0,'f',2) : QString("%1ms").arg(tval*1000.0f,0,'f',0);
+                p.drawLine(QPointF(tx, imgH), QPointF(tx, imgH+5));
+                p.drawText(QPointF(tx+2, imgH+18), lbl);
+            }
+            // frequency axis ticks
+            float fmin = 20.0f; float fmax = min(20000.0f, sampleRate/2.0f);
+            QVector<double> freqs = {20,50,100,200,500,1000,2000,5000,10000,20000};
+            for(double fq : freqs){ if(fq < fmin || fq > fmax) continue;
+                float t = logf(fq / fmin) / logf(fmax / fmin);
+                float row = t * float(max(1, imgH-1));
+                int y = int(round((imgH - 1) - row));
+                p.drawLine(QPointF(leftMargin-4, y), QPointF(leftMargin, y));
+                QString lbl = (fq>=1000.0) ? QString("%1k").arg(fq/1000.0,0,'f', (fq>=1000 && fq<10000)?1:0) : QString::number((int)fq);
+                p.drawText(QPointF(2, y+4), lbl);
+            }
+            p.end();
+            pph = pm;
+        }
+        specLabel->setPixmap(pph.scaled(specLabel->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+        // play using QAudioOutput (simple)
+        playBuffer(rendered);
+    }
 
-    // WAV Player and FFT display
-    WAVPlayer *wavPlayer;
-    QPushButton *btnLoadWav;
-    QPushButton *btnPlayWav;
-    QPushButton *btnStopWav;
-    QLabel *lblWavFile;
-    FFTWidget *fftWidget;
 
-    MidiFile midi;
-    vector<TrackSynthConfig> trackConfigs;
-    vector<float> rendered;
-    uint32_t sampleRate;
+// Las variables miembro ya están declaradas arriba
 };
 
 // --------------------------- main --------------------------------------------
 int main(int argc, char **argv){
     QApplication a(argc, argv);
+    QFile styleSheetFile("ASSD/Sinte_ASSD/Darkeum.qss");
+    styleSheetFile.open(QFile::ReadOnly);
+    QString styleSheet = QLatin1String(styleSheetFile.readAll());
+    a.setStyleSheet(styleSheet);
     MainWindow w;
     w.show();
     return a.exec();

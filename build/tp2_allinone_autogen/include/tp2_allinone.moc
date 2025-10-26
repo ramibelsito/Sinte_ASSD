@@ -244,15 +244,14 @@ QT_MOC_LITERAL(1, 11, 10), // "onLoadMidi"
 QT_MOC_LITERAL(2, 22, 0), // ""
 QT_MOC_LITERAL(3, 23, 8), // "onRender"
 QT_MOC_LITERAL(4, 32, 6), // "onSave"
-QT_MOC_LITERAL(5, 39, 9), // "onPreview"
-QT_MOC_LITERAL(6, 49, 10), // "playBuffer"
-QT_MOC_LITERAL(7, 60, 13), // "vector<float>"
-QT_MOC_LITERAL(8, 74, 3) // "buf"
+QT_MOC_LITERAL(5, 39, 10), // "playBuffer"
+QT_MOC_LITERAL(6, 50, 13), // "vector<float>"
+QT_MOC_LITERAL(7, 64, 3), // "buf"
+QT_MOC_LITERAL(8, 68, 9) // "onPreview"
 
     },
     "MainWindow\0onLoadMidi\0\0onRender\0onSave\0"
-    "onPreview\0playBuffer\0vector<float>\0"
-    "buf"
+    "playBuffer\0vector<float>\0buf\0onPreview"
 };
 #undef QT_MOC_LITERAL
 
@@ -273,15 +272,15 @@ static const uint qt_meta_data_MainWindow[] = {
        1,    0,   39,    2, 0x08 /* Private */,
        3,    0,   40,    2, 0x08 /* Private */,
        4,    0,   41,    2, 0x08 /* Private */,
-       5,    0,   42,    2, 0x08 /* Private */,
-       6,    1,   43,    2, 0x08 /* Private */,
+       5,    1,   42,    2, 0x08 /* Private */,
+       8,    0,   45,    2, 0x08 /* Private */,
 
  // slots: parameters
     QMetaType::Void,
     QMetaType::Void,
     QMetaType::Void,
+    QMetaType::Void, 0x80000000 | 6,    7,
     QMetaType::Void,
-    QMetaType::Void, 0x80000000 | 7,    8,
 
        0        // eod
 };
@@ -295,8 +294,8 @@ void MainWindow::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, 
         case 0: _t->onLoadMidi(); break;
         case 1: _t->onRender(); break;
         case 2: _t->onSave(); break;
-        case 3: _t->onPreview(); break;
-        case 4: _t->playBuffer((*reinterpret_cast< const vector<float>(*)>(_a[1]))); break;
+        case 3: _t->playBuffer((*reinterpret_cast< const vector<float>(*)>(_a[1]))); break;
+        case 4: _t->onPreview(); break;
         default: ;
         }
     }
