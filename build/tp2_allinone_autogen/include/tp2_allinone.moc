@@ -229,8 +229,8 @@ void WAVPlayer::fftUpdated(const vector<float> & _t1)
     QMetaObject::activate(this, &staticMetaObject, 0, _a);
 }
 struct qt_meta_stringdata_MainWindow_t {
-    QByteArrayData data[9];
-    char stringdata0[78];
+    QByteArrayData data[16];
+    char stringdata0[181];
 };
 #define QT_MOC_LITERAL(idx, ofs, len) \
     Q_STATIC_BYTE_ARRAY_DATA_HEADER_INITIALIZER_WITH_OFFSET(len, \
@@ -247,11 +247,21 @@ QT_MOC_LITERAL(4, 32, 6), // "onSave"
 QT_MOC_LITERAL(5, 39, 10), // "playBuffer"
 QT_MOC_LITERAL(6, 50, 13), // "vector<float>"
 QT_MOC_LITERAL(7, 64, 3), // "buf"
-QT_MOC_LITERAL(8, 68, 9) // "onPreview"
+QT_MOC_LITERAL(8, 68, 9), // "onPreview"
+QT_MOC_LITERAL(9, 78, 17), // "onApplyToSelected"
+QT_MOC_LITERAL(10, 96, 23), // "onTrackSelectionChanged"
+QT_MOC_LITERAL(11, 120, 10), // "uiToConfig"
+QT_MOC_LITERAL(12, 131, 17), // "TrackSynthConfig&"
+QT_MOC_LITERAL(13, 149, 3), // "cfg"
+QT_MOC_LITERAL(14, 153, 10), // "configToUI"
+QT_MOC_LITERAL(15, 164, 16) // "TrackSynthConfig"
 
     },
     "MainWindow\0onLoadMidi\0\0onRender\0onSave\0"
-    "playBuffer\0vector<float>\0buf\0onPreview"
+    "playBuffer\0vector<float>\0buf\0onPreview\0"
+    "onApplyToSelected\0onTrackSelectionChanged\0"
+    "uiToConfig\0TrackSynthConfig&\0cfg\0"
+    "configToUI\0TrackSynthConfig"
 };
 #undef QT_MOC_LITERAL
 
@@ -261,7 +271,7 @@ static const uint qt_meta_data_MainWindow[] = {
        8,       // revision
        0,       // classname
        0,    0, // classinfo
-       5,   14, // methods
+       9,   14, // methods
        0,    0, // properties
        0,    0, // enums/sets
        0,    0, // constructors
@@ -269,11 +279,15 @@ static const uint qt_meta_data_MainWindow[] = {
        0,       // signalCount
 
  // slots: name, argc, parameters, tag, flags
-       1,    0,   39,    2, 0x08 /* Private */,
-       3,    0,   40,    2, 0x08 /* Private */,
-       4,    0,   41,    2, 0x08 /* Private */,
-       5,    1,   42,    2, 0x08 /* Private */,
-       8,    0,   45,    2, 0x08 /* Private */,
+       1,    0,   59,    2, 0x08 /* Private */,
+       3,    0,   60,    2, 0x08 /* Private */,
+       4,    0,   61,    2, 0x08 /* Private */,
+       5,    1,   62,    2, 0x08 /* Private */,
+       8,    0,   65,    2, 0x08 /* Private */,
+       9,    0,   66,    2, 0x08 /* Private */,
+      10,    0,   67,    2, 0x08 /* Private */,
+      11,    1,   68,    2, 0x08 /* Private */,
+      14,    1,   71,    2, 0x08 /* Private */,
 
  // slots: parameters
     QMetaType::Void,
@@ -281,6 +295,10 @@ static const uint qt_meta_data_MainWindow[] = {
     QMetaType::Void,
     QMetaType::Void, 0x80000000 | 6,    7,
     QMetaType::Void,
+    QMetaType::Void,
+    QMetaType::Void,
+    QMetaType::Void, 0x80000000 | 12,   13,
+    QMetaType::Void, 0x80000000 | 15,   13,
 
        0        // eod
 };
@@ -296,6 +314,10 @@ void MainWindow::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, 
         case 2: _t->onSave(); break;
         case 3: _t->playBuffer((*reinterpret_cast< const vector<float>(*)>(_a[1]))); break;
         case 4: _t->onPreview(); break;
+        case 5: _t->onApplyToSelected(); break;
+        case 6: _t->onTrackSelectionChanged(); break;
+        case 7: _t->uiToConfig((*reinterpret_cast< TrackSynthConfig(*)>(_a[1]))); break;
+        case 8: _t->configToUI((*reinterpret_cast< const TrackSynthConfig(*)>(_a[1]))); break;
         default: ;
         }
     }
@@ -330,13 +352,13 @@ int MainWindow::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
     if (_id < 0)
         return _id;
     if (_c == QMetaObject::InvokeMetaMethod) {
-        if (_id < 5)
+        if (_id < 9)
             qt_static_metacall(this, _c, _id, _a);
-        _id -= 5;
+        _id -= 9;
     } else if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
-        if (_id < 5)
+        if (_id < 9)
             *reinterpret_cast<int*>(_a[0]) = -1;
-        _id -= 5;
+        _id -= 9;
     }
     return _id;
 }

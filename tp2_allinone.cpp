@@ -1056,6 +1056,7 @@ public:
     // Declaración de variables miembro
     QWidget *central;
     QPushButton *btnLoadMidi, *btnRender, *btnSave, *btnPreview;
+    QPushButton *btnApplyToSelected;
     QLabel *lblMidi;
     QListWidget *lstTracks;
     QComboBox *cmbSynth;
@@ -1225,8 +1226,10 @@ public:
         
         spinSecondsPerBeat = new QDoubleSpinBox; spinSecondsPerBeat->setRange(0.1,2.0); spinSecondsPerBeat->setValue(1.0);
         pf->addRow("sec/beat:", spinSecondsPerBeat);
-        btnPreview = new QPushButton("Preview note (A4)");
-        pf->addRow(btnPreview);
+    btnPreview = new QPushButton("Preview note (A4)");
+    pf->addRow(btnPreview);
+    btnApplyToSelected = new QPushButton("Apply to selected tracks");
+    pf->addRow(btnApplyToSelected);
 
         // Show/hide instrument selector based on synth type
         auto updateInstrumentVisibility = [this]() {
@@ -1300,10 +1303,12 @@ public:
     centralLayout->addWidget(specLabel);
 
         // Connections
-        connect(btnLoadMidi, &QPushButton::clicked, this, &MainWindow::onLoadMidi);
-        connect(btnRender, &QPushButton::clicked, this, &MainWindow::onRender);
-        connect(btnSave, &QPushButton::clicked, this, &MainWindow::onSave);
-        connect(btnPreview, &QPushButton::clicked, this, &MainWindow::onPreview);
+    connect(btnLoadMidi, &QPushButton::clicked, this, &MainWindow::onLoadMidi);
+    connect(btnRender, &QPushButton::clicked, this, &MainWindow::onRender);
+    connect(btnSave, &QPushButton::clicked, this, &MainWindow::onSave);
+    connect(btnPreview, &QPushButton::clicked, this, &MainWindow::onPreview);
+    connect(btnApplyToSelected, &QPushButton::clicked, this, &MainWindow::onApplyToSelected);
+    connect(lstTracks, &QListWidget::itemSelectionChanged, this, &MainWindow::onTrackSelectionChanged);
 
         // WAV player backend and UI connections
         wavPlayer = new WAVPlayer(this);
@@ -1339,6 +1344,7 @@ private slots:
         midi = mf;
         lblMidi->setText(QString("MIDI loaded: %1 tracks").arg(mf.tracks.size()));
         lstTracks->clear();
+        lstTracks->setSelectionMode(QAbstractItemView::MultiSelection);
         trackConfigs.clear();
         for(size_t i=0;i<mf.tracks.size();++i){
             QListWidgetItem *it = new QListWidgetItem(QString("Track %1: %2").arg((int)i).arg(QString::fromStdString(mf.tracks[i].name)));
@@ -1363,36 +1369,8 @@ private slots:
         progressBar->show();
         QApplication::processEvents();
 
-    // Set synth types according to ui (simple: same for all tracks)
-    TrackSynthConfig::Type type = TrackSynthConfig::ADDITIVE;
-    if(cmbSynth->currentText()=="FM") type = TrackSynthConfig::FM;
-    else if(cmbSynth->currentText()=="Karplus-Strong") type = TrackSynthConfig::KARPLUS;
-    else if(cmbSynth->currentText()=="Sample") type = TrackSynthConfig::SAMPLE;
-        
-        // Update track configs
-        for(auto &cfg: trackConfigs) {
-            cfg.type = type;
-            if(type == TrackSynthConfig::ADDITIVE) {
-                // Apply selected instrument preset
-                auto presets = InstrumentPreset::getAllPresets();
-                const auto& preset = presets[cmbInstrument->currentIndex()];
-                cfg.partialAmps = preset.partialAmps;
-                cfg.partialEnvs = preset.envelopes;
-                // Ensure sample rate is set for all envelopes
-                for(auto &env : cfg.partialEnvs) {
-                    env.sampleRate = sampleRate;
-                }
-            } else if(type == TrackSynthConfig::SAMPLE) {
-                // copy selected sample instrument data into track config
-                QString sel = cmbSampleInstrument->currentText();
-                if(sampleInstruments.count(sel)){
-                    const auto &srcCfg = sampleInstruments.at(sel);
-                    cfg.sampleMap = srcCfg.sampleMap;
-                    cfg.sampleRates = srcCfg.sampleRates;
-                    cfg.sampleInstrumentName = srcCfg.sampleInstrumentName;
-                }
-            }
-        }
+    // Note: per-track configs are respected. Use "Apply to selected tracks" to copy
+    // current UI synth/instrument into the selected tracks before rendering.
 
         float spb = spinSecondsPerBeat->value();
         rendered = renderMidi(midi, trackConfigs, spb, sampleRate,
@@ -1616,6 +1594,91 @@ private slots:
         specLabel->setPixmap(pph.scaled(specLabel->size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
         // play using QAudioOutput (simple)
         playBuffer(rendered);
+    }
+
+    // Apply current UI synth/instrument settings to all selected tracks in the list
+    void onApplyToSelected() {
+        auto items = lstTracks->selectedItems();
+        if(items.empty()){
+            QMessageBox::information(this, "No selection", "Select one or more tracks in the list to apply the current instrument/synth settings.");
+            return;
+        }
+        for(auto it : items){
+            int row = lstTracks->row(it);
+            if(row < 0 || (size_t)row >= trackConfigs.size()) continue;
+            // copy UI values into trackConfigs[row]
+            TrackSynthConfig cfg = trackConfigs[row];
+            uiToConfig(cfg);
+            trackConfigs[row] = cfg;
+        }
+        QMessageBox::information(this, "Applied", "Settings applied to selected tracks.");
+    }
+
+    // When track selection changes, if exactly one track is selected, update UI with its config
+    void onTrackSelectionChanged(){
+        auto items = lstTracks->selectedItems();
+        if(items.size() == 1){
+            int row = lstTracks->row(items[0]);
+            if(row >= 0 && (size_t)row < trackConfigs.size()){
+                configToUI(trackConfigs[row]);
+            }
+        }
+    }
+
+    // Copy current UI controls into a TrackSynthConfig
+    void uiToConfig(TrackSynthConfig &cfg){
+        QString synth = cmbSynth->currentText();
+        if(synth=="Additive") cfg.type = TrackSynthConfig::ADDITIVE;
+        else if(synth=="FM") cfg.type = TrackSynthConfig::FM;
+        else if(synth=="Karplus-Strong") cfg.type = TrackSynthConfig::KARPLUS;
+        else if(synth=="Sample") cfg.type = TrackSynthConfig::SAMPLE;
+        // additive
+        if(cfg.type == TrackSynthConfig::ADDITIVE){
+            auto presets = InstrumentPreset::getAllPresets();
+            int idx = cmbInstrument->currentIndex();
+            if(idx >=0 && idx < (int)presets.size()){
+                cfg.partialAmps = presets[idx].partialAmps;
+                cfg.partialEnvs = presets[idx].envelopes;
+                for(auto &e : cfg.partialEnvs) e.sampleRate = sampleRate;
+            }
+        } else if(cfg.type == TrackSynthConfig::SAMPLE){
+            QString sel = cmbSampleInstrument->currentText();
+            if(sampleInstruments.count(sel)){
+                const auto &src = sampleInstruments.at(sel);
+                cfg.sampleMap = src.sampleMap;
+                cfg.sampleRates = src.sampleRates;
+                cfg.sampleInstrumentName = src.sampleInstrumentName;
+            }
+        }
+        // FM/Karplus keep defaults unless further UI provided (could be extended)
+    }
+
+    // Load a TrackSynthConfig into the UI controls (reflect settings of a single track)
+    void configToUI(const TrackSynthConfig &cfg){
+        switch(cfg.type){
+            case TrackSynthConfig::ADDITIVE: cmbSynth->setCurrentText("Additive"); break;
+            case TrackSynthConfig::FM: cmbSynth->setCurrentText("FM"); break;
+            case TrackSynthConfig::KARPLUS: cmbSynth->setCurrentText("Karplus-Strong"); break;
+            case TrackSynthConfig::SAMPLE: cmbSynth->setCurrentText("Sample"); break;
+        }
+        // instrument preset match
+        auto presets = InstrumentPreset::getAllPresets();
+        for(int i=0;i<(int)presets.size();++i){
+            if(presets[i].name == cmbInstrument->itemText(i)){
+                // nothing here; we will try to match by name below
+            }
+        }
+        // try to set instrument combo to match partialAmps if possible by name
+        for(int i=0;i<(int)presets.size();++i){
+            if(presets[i].partialAmps == cfg.partialAmps){
+                cmbInstrument->setCurrentIndex(i);
+                break;
+            }
+        }
+        if(cfg.type == TrackSynthConfig::SAMPLE){
+            int idx = cmbSampleInstrument->findText(cfg.sampleInstrumentName);
+            if(idx >= 0) cmbSampleInstrument->setCurrentIndex(idx);
+        }
     }
 
 
