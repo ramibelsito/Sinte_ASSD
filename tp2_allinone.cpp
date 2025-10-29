@@ -750,87 +750,139 @@ vector<float> renderMidi(const MidiFile& mf, const vector<TrackSynthConfig>& con
 }
 
 // --------------------------- Spectrogram rendering (simple) --------------------
-QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=1024, int hop=512, bool useLogFreq = true, bool globalNormalize = true){
-    int Nwin = winSize;
-    int Nhop = hop;
-    size_t frames = (audio.size() < (size_t)Nwin) ? 1 : 1 + (audio.size()-Nwin)/Nhop;
-    int nbins = Nwin/2;
-    // target image height (frequency bins)
-    int height = nbins;
-    QImage img((int)frames, height, QImage::Format_RGB32);
-    img.fill(Qt::black);
-
-    // Precompute Hann window
-    vector<float> window(Nwin);
-    for(int i=0;i<Nwin;i++) window[i] = 0.5f*(1 - cos(2*M_PI*i/(Nwin-1)));
-
-    const float eps = 1e-12f;
-    const float fmin = 20.0f;
-    const float fmax = std::min(20000.0f, sr/2.0f);
-    const float dynamicRange = 80.0f; // display range in dB
-
-    vector<complex<float>> tin(Nwin), tout(Nwin);
-    // Matrix to store dB values per frame/bin
-    vector<float> dbmat(frames * nbins, -200.0f);
-
-    // Compute spectrogram (magnitude -> dB)
-    float globalMaxDb = -1e9f;
-    for(size_t frameIdx=0; frameIdx<frames; ++frameIdx){
-        size_t start = frameIdx * Nhop;
-        for(int n=0;n<Nwin;n++){
-            float s = (start + n < audio.size()) ? audio[start+n] : 0.0f;
-            tin[n] = complex<float>(s * window[n], 0.0f);
-        }
-        fft(&tin[0], &tout[0], Nwin);
-        for(int k=0;k<nbins;k++){
-            float mag = abs(tout[k]) / (float)Nwin; // normalization
-            float db = 20.0f * log10(max(eps, mag));
-            dbmat[frameIdx * nbins + k] = db;
-            if(db > globalMaxDb) globalMaxDb = db;
-        }
+QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=2048, int hop=256, bool useLogFreq = false, bool globalNormalize = true, ProgressCallback progressCb = nullptr){
+    if(audio.empty() || sr == 0) return QImage();
+    
+    // Calculate number of frames with higher resolution
+    size_t nFrames = 1 + (audio.size() - winSize) / hop;
+    if(nFrames < 2) return QImage();
+    
+    // Create window function (Hann)
+    vector<float> window(winSize);
+    for(int i = 0; i < winSize; i++) {
+        window[i] = 0.5f * (1.0f - cos(2.0f * M_PI * i / (winSize-1)));
     }
-
-    // Determine top/bottom dB for display
-    float topDb = globalMaxDb;
-    float bottomDb = topDb - dynamicRange;
-
-    // Render pixels
-    for(size_t frameIdx=0; frameIdx<frames; ++frameIdx){
-        for(int row=0; row<height; ++row){
-            // map row -> frequency
-            float t = float(row) / float(max(1, height-1));
-            float fy;
-            if(useLogFreq){
-                fy = fmin * powf(fmax/fmin, t);
-            } else {
-                fy = fmin + t * (fmax - fmin);
+    
+    // Prepare FFT buffers with larger window size
+    vector<complex<float>> fftIn(winSize), fftOut(winSize);
+    
+    // Matrix to store spectrogram data
+    vector<vector<float>> specData(nFrames);
+    float maxMagnitude = 0.0f;
+    float minMagnitude = INFINITY;
+    
+    // Process each frame
+    for(size_t frame = 0; frame < nFrames; frame++) {
+        // Fill FFT input buffer with windowed data
+        for(int i = 0; i < winSize; i++) {
+            size_t idx = frame * hop + i;
+            float sample = (idx < audio.size()) ? audio[idx] : 0.0f;
+            fftIn[i] = complex<float>(sample * window[i], 0);
+        }
+        
+        // Perform FFT
+        fft(&fftIn[0], &fftOut[0], winSize);
+        
+        // Calculate magnitudes for this frame
+        vector<float>& frameData = specData[frame];
+        frameData.resize(winSize/2);
+        for(int i = 0; i < winSize/2; i++) {
+            float magnitude = abs(fftOut[i]);
+            // Convert to dB scale with improved noise floor
+            magnitude = 20 * log10(max(magnitude, 1e-7f));
+            frameData[i] = magnitude;
+            if(globalNormalize) {
+                maxMagnitude = max(maxMagnitude, magnitude);
+                minMagnitude = min(minMagnitude, magnitude);
             }
-            // map frequency to bin (fractional)
-            float binPos = fy * (float)Nwin / (float)sr;
-            if(binPos < 0) binPos = 0;
-            if(binPos > (nbins - 1)) binPos = (float)(nbins - 1);
-            int b0 = (int)floor(binPos);
-            int b1 = min(nbins - 1, b0 + 1);
-            float frac = binPos - b0;
-            float dbv = (1.0f - frac) * dbmat[frameIdx * nbins + b0] + frac * dbmat[frameIdx * nbins + b1];
-
-            // map db to 0..1 between bottomDb..topDb
-            float v = (dbv - bottomDb) / (topDb - bottomDb);
-            v = std::max(0.0f, std::min(1.0f, v));
-
-            // colormap approximation: inferno-like (purple->yellow)
-            // map v (0..1) to hue roughly 270 (purple) -> 30 (yellow)
-            int hue = int(270 - v * 240); // 270..30
-            int sat = int(200 + v * 55); // increase saturation with intensity
-            int val = int(30 + v * 225);
-            QColor c = QColor::fromHsv(qBound(0, hue, 359), qBound(0, sat, 255), qBound(0, val, 255));
-
-            // image y coordinate: top is high freq, so invert row
-            int y = (height - 1) - row;
-            img.setPixel((int)frameIdx, y, c.rgb());
+        }
+        // report progress for spectrogram generation (normalized 0..1)
+        if(progressCb && (frame % 4 == 0 || frame + 1 == nFrames)){
+            float prog = float(frame+1) / float(nFrames);
+            progressCb(prog);
         }
     }
-
+    
+    // Create high resolution image (1920x1080 or maintain aspect ratio)
+    const int height = 1080;
+    const int width = min(1920, (int)nFrames);
+    QImage img(width, height, QImage::Format_RGB32);
+    img.fill(Qt::black);
+    
+    // Frequency scale parameters
+    float fMin = 20.0f;  // 20 Hz
+    float fMax = min(20000.0f, sr/2.0f);  // 20 kHz or Nyquist
+    
+    // Define color gradient points (from the image)
+    struct ColorPoint {
+        float pos;
+        QColor color;
+    };
+    
+    vector<ColorPoint> colorPoints = {
+        {0.0f, QColor(0, 0, 74)},      // Azul oscuro
+        {0.2f, QColor(55, 0, 110)},    // Púrpura oscuro
+        {0.4f, QColor(128, 0, 80)},    // Púrpura rojizo
+        {0.6f, QColor(200, 0, 0)},     // Rojo
+        {0.8f, QColor(255, 128, 0)},   // Naranja
+        {0.9f, QColor(255, 255, 0)},   // Amarillo
+        {1.0f, QColor(255, 255, 255)}  // Blanco
+    };
+    
+    // For each pixel column (time)
+    for(int x = 0; x < width; x++) {
+        // Map x to frame index
+        size_t frameIdx = x * (nFrames - 1) / (width - 1);
+        const vector<float>& frame = specData[frameIdx];
+        
+        // For each pixel row (frequency)
+        for(int y = 0; y < height; y++) {
+            // Map y coordinate to frequency (linear)
+            float t = float(height - 1 - y) / (height - 1);
+            float freq = fMin + (fMax - fMin) * t;
+            
+            // Convert frequency to FFT bin
+            float bin = freq * winSize / sr;
+            int binInt = (int)bin;
+            
+            if(binInt < 0 || binInt >= (winSize/2 - 1)) continue;
+            
+            // Improved interpolation between bins
+            float frac = bin - binInt;
+            float mag = frame[binInt] * (1-frac) + frame[binInt+1] * frac;
+            
+            // Enhanced normalization for better dynamic range
+            float normalizedMag;
+            if(globalNormalize) {
+                normalizedMag = (mag - minMagnitude) / (maxMagnitude - minMagnitude);
+            } else {
+                normalizedMag = (mag + 120.0f) / 120.0f;  // -120 to 0 dB range
+            }
+            normalizedMag = max(0.0f, min(1.0f, normalizedMag));
+            
+            // Find colors to interpolate between
+            QColor c1, c2;
+            float pos1 = 0.0f, pos2 = 1.0f;
+            for(size_t i = 0; i < colorPoints.size()-1; i++) {
+                if(normalizedMag >= colorPoints[i].pos && normalizedMag <= colorPoints[i+1].pos) {
+                    c1 = colorPoints[i].color;
+                    c2 = colorPoints[i+1].color;
+                    pos1 = colorPoints[i].pos;
+                    pos2 = colorPoints[i+1].pos;
+                    break;
+                }
+            }
+            
+            // Interpolate between colors
+            float t2 = (normalizedMag - pos1) / (pos2 - pos1);
+            int r = c1.red() + t2 * (c2.red() - c1.red());
+            int g = c1.green() + t2 * (c2.green() - c1.green());
+            int b = c1.blue() + t2 * (c2.blue() - c1.blue());
+            
+            img.setPixel(x, y, qRgb(r, g, b));
+        }
+    }
+    
     return img;
 }
 
@@ -1399,16 +1451,22 @@ private slots:
         progressBar->setValue(9000);
         QApplication::processEvents();
         
-        // spectrogram
-        QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512);
+        // spectrogram (provide progress callback to update progressBar from 9000..10000)
+        QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512, false, true,
+            [this](float p){
+                // p in [0..1] maps to 9000..10000
+                progressBar->setValue(9000 + int(p * 1000.0f));
+                QApplication::processEvents();
+            }
+        );
         // draw axes (time/frequency) and set pixmap
         auto pix = [&]()->QPixmap{
             // create pixmap with axes
             int imgW = spec.width();
             int imgH = spec.height();
             // margin for labels
-            int leftMargin = 60;
-            int bottomMargin = 24;
+            int leftMargin = 80;
+            int bottomMargin = 30;
             QPixmap pm(leftMargin + imgW, imgH + bottomMargin);
             pm.fill(Qt::black);
             QPainter p(&pm);
@@ -1419,7 +1477,7 @@ private slots:
             // draw spectrogram image
             p.drawImage(leftMargin, 0, spec);
             p.setPen(Qt::white);
-            QFont f = p.font(); f.setPointSize(10); p.setFont(f);
+            QFont f = p.font(); f.setPointSize(24); f.setBold(true); p.setFont(f);
             
             // time axis (bottom)
             float duration = (rendered.empty()) ? 0.0f : (float(rendered.size())/sampleRate);
@@ -1429,20 +1487,24 @@ private slots:
                 float tval = duration * (float(i)/ticks);
                 QString lbl = (tval>=1.0f) ? QString("%1s").arg(tval,0,'f',2) : QString("%1ms").arg(tval*1000.0f,0,'f',0);
                 p.drawLine(QPointF(tx, imgH), QPointF(tx, imgH+5));
-                p.drawText(QPointF(tx-20, imgH+18), lbl);
+                p.drawText(QPointF(tx-20, imgH+22), lbl);
             }
-            // frequency axis (left) - log ticks
+            // frequency axis (left) - linear ticks
             float fmin = 20.0f; float fmax = min(20000.0f, sampleRate/2.0f);
-            QVector<double> freqs = {20,50,100,200,500,1000,2000,5000,10000,20000};
+            // Crear ticks linealmente espaciados
+            QVector<double> freqs;
+            for(int i = 0; i <= 10; i++) {
+                freqs.push_back(fmin + (fmax - fmin) * i / 10.0);
+            }
             for(double fq : freqs){
                 if(fq < fmin || fq > fmax) continue;
-                // compute row as in renderSpectrogram
-                float t = logf(fq / fmin) / logf(fmax / fmin);
+                // compute row using linear mapping
+                float t = (fq - fmin) / (fmax - fmin);
                 float row = t * float(max(1, imgH-1));
                 int y = int(round((imgH - 1) - row));
                 p.drawLine(QPointF(leftMargin-4, y), QPointF(leftMargin, y));
                 QString lbl = (fq>=1000.0) ? QString("%1k").arg(fq/1000.0,0,'f', (fq>=1000 && fq<10000)?1:0) : QString::number((int)fq);
-                p.drawText(QPointF(2, y+4), lbl);
+                p.drawText(QPointF(6, y+6), lbl);
             }
             p.end();
             return pm;
@@ -1537,7 +1599,7 @@ private slots:
         }
         // store rendered and show spectrogram
         rendered = buf;
-        QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512);
+    QImage spec = renderSpectrogram(rendered, sampleRate, 1024, 512, false, true, nullptr);
 
         // overlay harmonics for A4 preview to help visual verification
         overlayHarmonics(spec, sampleRate, 1024, 440.0f, 12, 20.0f);
@@ -1546,14 +1608,14 @@ private slots:
         {
             int imgW = spec.width();
             int imgH = spec.height();
-            int leftMargin = 60;
-            int bottomMargin = 24;
+            int leftMargin = 80;
+            int bottomMargin = 30;
             QPixmap pm(leftMargin + imgW, imgH + bottomMargin);
             pm.fill(Qt::black);
             QPainter p(&pm);
             p.drawImage(leftMargin, 0, spec);
             p.setPen(Qt::white);
-            QFont f = p.font(); f.setPointSize(10); p.setFont(f);
+            QFont f = p.font(); f.setPointSize(14); f.setBold(true); p.setFont(f);
             // time axis
             float duration = (rendered.empty()) ? 0.0f : (float(rendered.size())/sampleRate);
             int ticks = 5;
@@ -1562,7 +1624,7 @@ private slots:
                 float tval = duration * (float(i)/ticks);
                 QString lbl = (tval>=1.0f) ? QString("%1s").arg(tval,0,'f',2) : QString("%1ms").arg(tval*1000.0f,0,'f',0);
                 p.drawLine(QPointF(tx, imgH), QPointF(tx, imgH+5));
-                p.drawText(QPointF(tx+2, imgH+18), lbl);
+                p.drawText(QPointF(tx+2, imgH+22), lbl);
             }
             // frequency axis ticks
             float fmin = 20.0f; float fmax = min(20000.0f, sampleRate/2.0f);
@@ -1573,7 +1635,7 @@ private slots:
                 int y = int(round((imgH - 1) - row));
                 p.drawLine(QPointF(leftMargin-4, y), QPointF(leftMargin, y));
                 QString lbl = (fq>=1000.0) ? QString("%1k").arg(fq/1000.0,0,'f', (fq>=1000 && fq<10000)?1:0) : QString::number((int)fq);
-                p.drawText(QPointF(2, y+4), lbl);
+                p.drawText(QPointF(6, y+6), lbl);
             }
             p.end();
             pph = pm;
