@@ -750,12 +750,13 @@ vector<float> renderMidi(const MidiFile& mf, const vector<TrackSynthConfig>& con
 }
 
 // --------------------------- Spectrogram rendering (simple) --------------------
-QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=1024, int hop=512){
+QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=1024, int hop=512, bool useLogFreq = true, bool globalNormalize = true){
     int Nwin = winSize;
     int Nhop = hop;
     size_t frames = (audio.size() < (size_t)Nwin) ? 1 : 1 + (audio.size()-Nwin)/Nhop;
-    // target image height (frequency bins). Use Nwin/2 but allow fewer to improve vertical resolution if desired
-    int height = Nwin/2;
+    int nbins = Nwin/2;
+    // target image height (frequency bins)
+    int height = nbins;
     QImage img((int)frames, height, QImage::Format_RGB32);
     img.fill(Qt::black);
 
@@ -763,80 +764,66 @@ QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=10
     vector<float> window(Nwin);
     for(int i=0;i<Nwin;i++) window[i] = 0.5f*(1 - cos(2*M_PI*i/(Nwin-1)));
 
-    // For each frame compute FFT magnitudes (only first Nwin/2 bins)
     const float eps = 1e-12f;
     const float fmin = 20.0f;
     const float fmax = std::min(20000.0f, sr/2.0f);
     const float dynamicRange = 80.0f; // display range in dB
 
     vector<complex<float>> tin(Nwin), tout(Nwin);
-    vector<float> magDB(Nwin/2);
+    // Matrix to store dB values per frame/bin
+    vector<float> dbmat(frames * nbins, -200.0f);
 
+    // Compute spectrogram (magnitude -> dB)
+    float globalMaxDb = -1e9f;
     for(size_t frameIdx=0; frameIdx<frames; ++frameIdx){
         size_t start = frameIdx * Nhop;
-        // fill input buffer with windowed samples
         for(int n=0;n<Nwin;n++){
             float s = (start + n < audio.size()) ? audio[start+n] : 0.0f;
             tin[n] = complex<float>(s * window[n], 0.0f);
         }
-        // FFT
         fft(&tin[0], &tout[0], Nwin);
-
-        // magnitude -> dB
-        float maxDb = -1e9f;
-        for(int k=0;k<Nwin/2;k++){
+        for(int k=0;k<nbins;k++){
             float mag = abs(tout[k]) / (float)Nwin; // normalization
             float db = 20.0f * log10(max(eps, mag));
-            magDB[k] = db;
-            if(db > maxDb) maxDb = db;
+            dbmat[frameIdx * nbins + k] = db;
+            if(db > globalMaxDb) globalMaxDb = db;
         }
+    }
 
-        // set display range relative to maxDb
-        float topDb = maxDb; // 0 dB reference is local max
-        float bottomDb = topDb - dynamicRange;
+    // Determine top/bottom dB for display
+    float topDb = globalMaxDb;
+    float bottomDb = topDb - dynamicRange;
 
-        // For each vertical pixel (row) compute corresponding frequency (log scale) and interpolate bin dB
+    // Render pixels
+    for(size_t frameIdx=0; frameIdx<frames; ++frameIdx){
         for(int row=0; row<height; ++row){
-            // row 0 -> low freq (bottom), row height-1 -> high freq (top)
+            // map row -> frequency
             float t = float(row) / float(max(1, height-1));
-            // logarithmic mapping from fmin..fmax
-            float fy = fmin * powf(fmax/fmin, t);
-            // corresponding bin (fractional)
+            float fy;
+            if(useLogFreq){
+                fy = fmin * powf(fmax/fmin, t);
+            } else {
+                fy = fmin + t * (fmax - fmin);
+            }
+            // map frequency to bin (fractional)
             float binPos = fy * (float)Nwin / (float)sr;
             if(binPos < 0) binPos = 0;
-            if(binPos > (Nwin/2 - 1)) binPos = (float)(Nwin/2 - 1);
+            if(binPos > (nbins - 1)) binPos = (float)(nbins - 1);
             int b0 = (int)floor(binPos);
-            int b1 = min((int)(Nwin/2 - 1), b0 + 1);
+            int b1 = min(nbins - 1, b0 + 1);
             float frac = binPos - b0;
-            float dbv = (1.0f - frac) * magDB[b0] + frac * magDB[b1];
+            float dbv = (1.0f - frac) * dbmat[frameIdx * nbins + b0] + frac * dbmat[frameIdx * nbins + b1];
 
             // map db to 0..1 between bottomDb..topDb
             float v = (dbv - bottomDb) / (topDb - bottomDb);
             v = std::max(0.0f, std::min(1.0f, v));
-            int iv = (int)round(v * 255.0f);
 
-            // colormap: blue (low) -> cyan -> yellow -> red (high)
-            // map iv 0..255 to HSV-like color via manual interpolation
-            QColor c;
-            if(iv <= 85){ // blue -> cyan
-                float t2 = iv / 85.0f;
-                int r = (int)round(0 + t2 * 0);
-                int g = (int)round(0 + t2 * 255);
-                int b = (int)round(128 + t2 * 127);
-                c = QColor(r,g,b);
-            } else if(iv <= 170){ // cyan -> yellow
-                float t2 = (iv - 85) / 85.0f;
-                int r = (int)round(0 + t2 * 255);
-                int g = 255;
-                int b = (int)round(255 - t2 * 255);
-                c = QColor(r,g,b);
-            } else { // yellow -> red
-                float t2 = (iv - 170) / 85.0f;
-                int r = 255;
-                int g = (int)round(255 - t2 * 255);
-                int b = 0;
-                c = QColor(r,g,b);
-            }
+            // colormap approximation: inferno-like (purple->yellow)
+            // map v (0..1) to hue roughly 270 (purple) -> 30 (yellow)
+            int hue = int(270 - v * 240); // 270..30
+            int sat = int(200 + v * 55); // increase saturation with intensity
+            int val = int(30 + v * 225);
+            QColor c = QColor::fromHsv(qBound(0, hue, 359), qBound(0, sat, 255), qBound(0, val, 255));
 
             // image y coordinate: top is high freq, so invert row
             int y = (height - 1) - row;
