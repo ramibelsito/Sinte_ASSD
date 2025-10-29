@@ -1,6 +1,6 @@
 // tp2_allinone.cpp
 // Trabajo práctico 2024 - Implementación todo en 1 archivo usando Qt Widgets
-// Funcionalidades: FFT (Cooley-Tukey), parser MIDI simple, síntesis aditiva, FM,
+// Funcionalidades: FFT , parser MIDI simple, síntesis aditiva, FM,
 // Karplus-Strong, sample playback (WAV), delay/reverb simples, espectrograma, export WAV.
 // Compilar con Qt (widgets, multimedia). C++17.
 
@@ -108,7 +108,7 @@ bool readWAV(const QString &filename, vector<float>& out, uint32_t& sampleRate) 
     return true;
 }
 
-// --------------------------- FFT Cooley-Tukey (radix-2) -------------------------
+// --------------------------- FFT -------------------------
 void fft_recursive(const vector<cfloat>& in, vector<cfloat>& out, size_t n, size_t stride) {
     if (n==1) {
         out[0] = in[0];
@@ -185,7 +185,6 @@ void applyHann(vector<float>& buf){
 // --------------------------- MIDI parser (simple) ------------------------------
 // Minimal MIDI parser to extract tracks and Note On/Off events with delta times.
 // Supports format 0 and 1, common tick division, running status naive handling.
-// Not a full-featured parser; extend as needed.
 
 struct MidiEvent {
     uint32_t time; // absolute ticks
@@ -677,7 +676,7 @@ vector<float> renderMidi(const MidiFile& mf, const vector<TrackSynthConfig>& con
         const auto& tr = mf.tracks[ti];
         if(ti >= configs.size()) break;
         const auto& cfg = configs[ti];
-        // Build list of note-on -> note-off pairs (very naive: search next off)
+        // Build list of note-on -> note-off pairs and render each note
         for(size_t eidx=0; eidx<tr.events.size(); ++eidx){
             const auto& ev = tr.events[eidx];
             if(ev.type==0x9 && ev.vel>0){
@@ -860,26 +859,43 @@ QImage renderSpectrogram(const vector<float>& audio, uint32_t sr, int winSize=20
             }
             normalizedMag = max(0.0f, min(1.0f, normalizedMag));
             
-            // Find colors to interpolate between
-            QColor c1, c2;
-            float pos1 = 0.0f, pos2 = 1.0f;
-            for(size_t i = 0; i < colorPoints.size()-1; i++) {
-                if(normalizedMag >= colorPoints[i].pos && normalizedMag <= colorPoints[i+1].pos) {
-                    c1 = colorPoints[i].color;
-                    c2 = colorPoints[i+1].color;
-                    pos1 = colorPoints[i].pos;
-                    pos2 = colorPoints[i+1].pos;
-                    break;
-                }
+            // High-contrast HSV mapping for better color resolution.
+            // Map normalized magnitude -> hue (degrees), saturation, value
+            // Use a wide hue sweep (blue -> green -> yellow -> red) and high saturation.
+            float h = (1.0f - normalizedMag) * 260.0f; // 260..0 degrees
+            float s = 0.98f;
+            // value follows normalizedMag but push up low values slightly for visibility
+            float v = powf(normalizedMag, 0.85f) * 0.95f + 0.05f;
+
+            // Apply user request: replace green with blue, and blue with black.
+            // Green region roughly corresponds to hue ~90..150. Map that to blue (220).
+            if(h >= 90.0f && h <= 150.0f) {
+                h = 220.0f; // blue
             }
-            
-            // Interpolate between colors
-            float t2 = (normalizedMag - pos1) / (pos2 - pos1);
-            int r = c1.red() + t2 * (c2.red() - c1.red());
-            int g = c1.green() + t2 * (c2.green() - c1.green());
-            int b = c1.blue() + t2 * (c2.blue() - c1.blue());
-            
-            img.setPixel(x, y, qRgb(r, g, b));
+            // Blue region roughly corresponds to hue >=200. Map that to black.
+            if(h >= 200.0f && h <= 260.0f) {
+                img.setPixel(x, y, qRgb(0,0,0));
+            } else {
+                // HSV -> RGB conversion
+                float C = v * s;
+                float X = C * (1.0f - fabs(fmodf(h / 60.0f, 2.0f) - 1.0f));
+                float m = v - C;
+                float rp=0, gp=0, bp=0;
+                if(h >= 0 && h < 60){ rp = C; gp = X; bp = 0; }
+                else if(h < 120){ rp = X; gp = C; bp = 0; }
+                else if(h < 180){ rp = 0; gp = C; bp = X; }
+                else if(h < 240){ rp = 0; gp = X; bp = C; }
+                else if(h < 300){ rp = X; gp = 0; bp = C; }
+                else { rp = C; gp = 0; bp = X; }
+
+                int r = int((rp + m) * 255.0f);
+                int g = int((gp + m) * 255.0f);
+                int b = int((bp + m) * 255.0f);
+                r = max(0, min(255, r));
+                g = max(0, min(255, g));
+                b = max(0, min(255, b));
+                img.setPixel(x, y, qRgb(r, g, b));
+            }
         }
     }
     
@@ -1078,7 +1094,6 @@ private slots:
         
         emit fftUpdated(mags);
         
-        // Seek back if needed
         if(pos >= buffer->size())
             buffer->seek(0);
     }
@@ -1737,10 +1752,6 @@ private slots:
 // --------------------------- main --------------------------------------------
 int main(int argc, char **argv){
     QApplication a(argc, argv);
-    QFile styleSheetFile("ASSD/Sinte_ASSD/Darkeum.qss");
-    styleSheetFile.open(QFile::ReadOnly);
-    QString styleSheet = QLatin1String(styleSheetFile.readAll());
-    a.setStyleSheet(styleSheet);
     MainWindow w;
     w.show();
     return a.exec();
